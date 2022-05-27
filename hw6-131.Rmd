@@ -1,0 +1,335 @@
+---
+title: "hw6-pstat131"
+author: "Evan Hope"
+date: "5/23/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+```
+
+
+```{r}
+# loading packages
+
+library(tidyverse)
+library(tidymodels)
+library(ISLR)
+library(rpart.plot)
+library(vip)
+library(janitor)
+library(randomForest)
+library(xgboost)
+
+tidymodels_prefer()
+
+```
+
+Question 1.) Setting up things like we did in the beginning of homework 5.
+
+
+```{r}
+set.seed(444)
+
+pokemon <- read.csv("C:/Users/Ordai/OneDrive/Desktop/School/Stats/PSTAT 131/Pokemon.csv")
+
+```
+
+
+```{r}
+# Cleaning the data now.
+
+pokemon <- pokemon %>% 
+  clean_names()
+```
+
+```{r}
+# Filtering the data:
+
+pokemon_filtered <- pokemon %>%
+  filter(type_1 == "Bug" | type_1 == "Fire" | type_1 == "Grass" | type_1 == "Normal" | type_1 == "Water" | type_1 == "Physic")
+
+# And now changing variables into factors…
+
+pokemon_filtered$type_1 <- factor(pokemon_filtered$type_1)
+
+pokemon_filtered$legendary <- factor(pokemon_filtered$legendary)
+
+pokemon_filtered$generation <- factor(pokemon_filtered$generation)
+```
+
+```{r}
+# the initial split of the data...
+
+pokemon_split <- initial_split(pokemon_filtered, prop = .70, strata = type_1)
+
+pokemon_train <- training(pokemon_split)
+pokemon_test <- testing(pokemon_split)
+
+
+# Performing 5 fold cross validation…
+
+pokemon_train_5fold <- vfold_cv(pokemon_train, v = 5, strata = type_1)
+
+# Recipe
+
+pokemon_recipe <- recipe(type_1 ~ legendary + generation + sp_atk + attack + speed + defense + hp + sp_def, data = pokemon_train) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_predictors())
+```
+We are now ready to move on.
+
+
+
+Question 2.) Correlation matrix.
+
+First I need to load the needed package.
+```{r}
+library(corrplot)
+```
+```{r}
+library(corrr)
+```
+
+Plotting the correlation matrix with only the continuous variables...
+```{r}
+poke_corrlate <- pokemon_train %>%
+  select(-x, -name, -type_1, -type_2, -legendary, -generation) %>%
+  correlate()
+
+rplot(poke_corrlate)
+```
+
+The relationships between these variables makes sense to me. It is obvious that 'total' has relationships with the other variables since total represents a combination of the other variables as one value. Similar things can be said for the other variables and the values combined to get their values. Long story short, as one increases, the other(s) increase too.
+
+
+
+Question 3.) Decision tree
+
+```{r}
+poke_tree <- decision_tree() %>%
+  set_engine("rpart")
+```
+
+```{r}
+class_poke_tree <- poke_tree %>%
+  set_mode("classification")
+```
+
+```{r}
+class_poke_tree_wf <- workflow() %>%
+  add_model(class_poke_tree %>% set_args(cost_complexity = tune())) %>%
+  add_formula(type_1 ~ legendary + generation + sp_atk + attack + speed + defense + hp + sp_def)
+```
+
+```{r}
+poke_grid <- grid_regular(cost_complexity(range = c(-3, -1)), levels = 10)
+
+tune_res <- tune_grid(class_poke_tree_wf, 
+  resamples = pokemon_train_5fold, 
+  grid = poke_grid, 
+  metrics = metric_set(roc_auc))
+```
+
+```{r}
+autoplot(tune_res)
+```
+
+As we can see, the ROC AUC is best at around 0.01 and smaller values. Model performs worse as complexity penalty increases.
+
+```{r}
+best_complexity <- select_best(tune_res, metric = "roc_auc")
+
+poke_tree_best <- finalize_workflow(class_poke_tree_wf, best_complexity)
+
+poke_tree_best_fit <- fit(poke_tree_best, data = pokemon_train)
+```
+
+
+```{r}
+collect_metrics(tune_res) %>%
+  arrange(mean)
+```
+```{r}
+best_complexity
+```
+As we can see, the ROC_AUC of our best performing model was: 0.6419693 . This occurs with a cost complexity of 0.007742637 . 
+
+Question 5.) Visual of best fitted model.
+
+```{r}
+poke_tree_best_fit %>%
+  extract_fit_engine() %>%
+  rpart.plot()
+```
+```{r}
+library(ranger)
+```
+
+
+Tuning Parameters:
+a.) trees = # number of trees for the model
+b.) mtry = # of variables to be sampled
+c.) min_n = minimum # of points in a tree in order for
+the tree to be split further
+
+
+```{r}
+bagging <- rand_forest(mtry = tune(), trees = tune(), min_n = tune())%>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+```
+```{r}
+poke_rf_wf <- workflow() %>%
+  add_model(bagging) %>%
+  add_formula(type_1 ~ legendary + generation + sp_atk + attack + speed + defense + hp + sp_def)
+```
+
+regular grid with 8 levels...
+```{r}
+poke_regular_grid <- grid_regular(mtry(range = c(0,7)), trees(range = c(0,300)), min_n(range = c(0,10)), levels = 8)
+```
+
+Since our grid has 8 levels each, it makes sense that that the maximum amount of variables to be sampled at each fold is 8. Greater than/ equal to 1 because it makes no sense to sample 0 variables.
+
+A model of mtry: 8 would be a model with 8 randomly sampled variables.
+
+
+
+Question 6.) 
+```{r}
+tune_res_2 <- tune_grid(poke_rf_wf, 
+  resamples = pokemon_train_5fold, 
+  grid = poke_regular_grid, 
+  metrics = metric_set(roc_auc))
+
+autoplot(tune_res_2)
+```
+From this it is easy to tell that the 42 trees model is the worst of the bunch while it seems the 171 or 128 trees model appears best.
+
+7.) Finding roc_auc of our best model.
+
+```{r}
+best_tree <- select_best(tune_res_2, metric = "roc_auc")
+
+best_tree
+```
+```{r}
+collect_metrics(tune_res_2) %>%
+  arrange(mean)
+```
+The roc_auc of our best model is: 0.7067818.
+parameters being...
+
+mtry = 3
+trees = 128
+min_n = 5
+
+```{r}
+bagging_final <- rand_forest(mtry = 3, trees = 128, min_n = 5) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+```
+
+```{r}
+final_fit <- fit(bagging_final, type_1 ~ legendary + generation + sp_atk + attack + speed + defense + hp + sp_def, data = pokemon_train)
+```
+
+```{r}
+vip(final_fit)
+```
+
+According to this, sp_attack and speed are the most important variables while legendary is least important.
+
+This is about what I expected because I know the generation and legendary would have little to no importance.
+
+
+8.) boosted tree workflow and model
+
+```{r}
+boost_spec <- boost_tree(trees = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+```
+
+
+```{r}
+poke_rf_wf2 <- workflow() %>%
+  add_model(boost_spec) %>%
+  add_formula(type_1 ~ legendary + generation + sp_atk + attack + speed + defense + hp + sp_def)
+```
+
+regular grid with 8 levels...
+```{r}
+poke_regular_grid2 <- grid_regular(trees(range = c(10,2000)), levels = 10)
+```
+
+
+```{r}
+tune_res_3 <- tune_grid(poke_rf_wf2, 
+  resamples = pokemon_train_5fold, 
+  grid = poke_regular_grid2, 
+  metrics = metric_set(roc_auc))
+
+autoplot(tune_res_3)
+```
+As we can see, the more trees the better to an extent. It peaks at around 450 trees visually from the graph.
+
+```{r}
+best_model <- select_best(tune_res_3, metric = "roc_auc")
+
+best_model
+```
+```{r}
+collect_metrics(tune_res_3) %>%
+  arrange(mean)
+```
+
+The roc auc of our best model selection is 0.6812453.
+This is the model with 452 trees.
+
+10.) So our three roc auc values are...
+
+pruned tree model = 0.6419693
+random forest model = 0.7067818
+boosted tree model = 0.6812453
+
+And from here it is easy to see that our random forest model is the best to choose from.
+
+
+finalizing the workflow...
+
+```{r}
+final_wkflow <- finalize_workflow(poke_rf_wf, best_tree)
+
+best_overall_model <- fit(final_wkflow, data = pokemon_train)
+```
+
+
+```{r}
+last_fit <- augment(best_overall_model, new_data = pokemon_test)%>%
+  roc_curve(truth = type_1, .pred_Bug, .pred_Fire, .pred_Grass, .pred_Normal, .pred_Water)
+
+
+autoplot(last_fit, type = 'heatmap')
+```
+```{r}
+last_fit_2 <- augment(best_overall_model, new_data = pokemon_test)%>%
+  roc_auc(truth = type_1, .pred_Bug, .pred_Fire, .pred_Grass, .pred_Normal, .pred_Water)
+
+last_fit_2
+```
+roc_auc value of 0.7318363  !!!
+
+
+
+last_fit3 <- augment(best_overall_model, new_data = pokemon_train)%>%
+  conf_mat(truth = type_1, .pred_Bug, .pred_Fire, .pred_Grass, .pred_Normal, .pred_Water) %>%
+  autoplot(last_fit2, type = 'heatmap')
+
+
